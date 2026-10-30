@@ -1,0 +1,1020 @@
+/* ============================================================
+   Junior Science — Shared Topic Framework (kit.jsx)
+   Builds a full topic app from a CONFIG object.
+   All components are attached to window so per-topic content
+   files can use them as globals (Babel-standalone friendly).
+   ============================================================ */
+/* global React, ReactDOM */
+const { useState, useEffect, useRef, useMemo, useCallback, useContext, useId } = React;
+
+/* ---------- persistence ---------- */
+function useLocalStorage(key, initial) {
+  const [v, setV] = useState(() => {
+    try { const raw = localStorage.getItem(key); return raw !== null ? JSON.parse(raw) : initial; }
+    catch { return initial; }
+  });
+  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
+  return [v, setV];
+}
+
+/* Topic-wide context so leaf components (quizzes, etc.) can derive a stable
+   localStorage key without every content.jsx having to pass the topic key. */
+const TopicContext = React.createContext({ skey: null });
+
+/* tiny stable string hash -> short base36, for per-question storage keys */
+function hashStr(s) {
+  s = String(s == null ? "" : s);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+  return (h >>> 0).toString(36);
+}
+function answerKey(skey, kind, num, question) {
+  return (skey || "anon") + "." + kind + "." + (num == null ? "" : num) + "." + hashStr(question);
+}
+
+/* Respect the OS "reduce motion" setting in JS-driven animations
+   (a CSS media query can't stop a setInterval). content.jsx can call this. */
+function useReducedMotion() {
+  const [reduced, setReduced] = useState(() => {
+    try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch { return false; }
+  });
+  useEffect(() => {
+    let mq;
+    try { mq = window.matchMedia("(prefers-reduced-motion: reduce)"); } catch { return; }
+    const on = () => setReduced(mq.matches);
+    if (mq.addEventListener) mq.addEventListener("change", on); else mq.addListener(on);
+    return () => { if (mq.removeEventListener) mq.removeEventListener("change", on); else mq.removeListener(on); };
+  }, []);
+  return reduced;
+}
+
+/* Per-topic quiz results (for the end-of-topic review / "redo what you got
+   wrong"). Stored separately from the per-question answers so we can list
+   wrong answers by section without re-rendering every question. */
+function recordMCQResult(skey, qkey, ok, section) {
+  if (!skey) return;
+  try {
+    var k = skey + ".results";
+    var m = JSON.parse(localStorage.getItem(k) || "{}");
+    m[qkey] = { ok: !!ok, section: section || null };
+    localStorage.setItem(k, JSON.stringify(m));
+  } catch (e) {}
+}
+function readMCQResults(skey) {
+  try { return JSON.parse(localStorage.getItem(skey + ".results") || "{}"); } catch (e) { return {}; }
+}
+function clearMCQResults(skey, pred) {
+  try {
+    var k = skey + ".results";
+    var m = JSON.parse(localStorage.getItem(k) || "{}");
+    Object.keys(m).forEach(function (qk) { if (pred(m[qk], qk)) { delete m[qk]; } });
+    localStorage.setItem(k, JSON.stringify(m));
+  } catch (e) {}
+}
+
+/* ---------- completion stats + downloadable certificate ---------- */
+const BRANCH_ACCENT = {
+  biology: "#2e7d56", chemistry: "#1f6f8b", physics: "#b9770e",
+  "earth-space": "#5b53b0", earthspace: "#5b53b0", astronomy: "#5b53b0",
+  environmental: "#1f8b7d", change: "#7a3a9b", general: "#475569"
+};
+function readAttempts(qkey) {
+  try { return JSON.parse(localStorage.getItem(qkey + ".att") || "0") || 0; } catch (e) { return 0; }
+}
+function gatherTopicStats(skey, done, total) {
+  const results = readMCQResults(skey);
+  const qkeys = Object.keys(results);
+  let correct = 0, totalAttempts = 0, firstTry = 0;
+  qkeys.forEach(function (k) {
+    const ok = !!(results[k] && results[k].ok);
+    const att = readAttempts(k) || 1;
+    if (ok) correct++;
+    totalAttempts += att;
+    if (ok && att === 1) firstTry++;
+  });
+  const answered = qkeys.length;
+  return {
+    sectionsDone: done, sectionsTotal: total,
+    answered: answered, correct: correct, wrong: answered - correct,
+    totalAttempts: totalAttempts || answered, firstTry: firstTry,
+    accuracy: answered ? Math.round(100 * correct / answered) : 0,
+    firstTryPct: answered ? Math.round(100 * firstTry / answered) : 0
+  };
+}
+function certCode(name, skey, stats) {
+  const basis = String(name || "").trim().toLowerCase() + "|" + skey + "|" +
+    stats.sectionsDone + "/" + stats.sectionsTotal + "|" + stats.correct + "/" + stats.answered;
+  const h = hashStr(basis).toUpperCase();
+  let sum = 0; for (let i = 0; i < basis.length; i++) sum += basis.charCodeAt(i);
+  const cs = (sum % 36).toString(36).toUpperCase();
+  const abbr = String(skey || "whs").replace(/[^a-z0-9]/gi, "").slice(-4).toUpperCase();
+  return "WHS-" + abbr + "-" + h + cs;
+}
+function _rr(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function downloadCertificatePNG(opts) {
+  const W = 2000, H = 1414;
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  const accent = opts.accent || "#1f6f8b";
+  const ink = "#1f2933", soft = "#52606d", line = "#dce1e7";
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = ink; ctx.lineWidth = 10; ctx.strokeRect(40, 40, W - 80, H - 80);
+  ctx.strokeStyle = accent; ctx.lineWidth = 4; ctx.strokeRect(70, 70, W - 140, H - 140);
+  ctx.fillStyle = accent; ctx.fillRect(70, 70, W - 140, 16);
+  // diagonal repeating watermark (harder to alter cleanly)
+  ctx.save();
+  ctx.globalAlpha = 0.05; ctx.fillStyle = ink;
+  ctx.translate(W / 2, H / 2); ctx.rotate(-Math.PI / 6);
+  ctx.font = "bold 42px Helvetica, Arial, sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  var unit = "WOONONA HS · VERIFIED · " + opts.code + " · ";
+  var wmLine = ""; while (wmLine.length < 130) wmLine += unit;
+  for (var wy = -1500; wy <= 1500; wy += 120) ctx.fillText(wmLine, 0, wy);
+  ctx.restore();
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "center";
+  ctx.fillStyle = soft; ctx.font = "600 34px Helvetica, Arial, sans-serif";
+  ctx.fillText("WOONONA HIGH SCHOOL · JUNIOR SCIENCE", W / 2, 205);
+  ctx.fillStyle = ink; ctx.font = "bold 94px Georgia, 'Times New Roman', serif";
+  ctx.fillText("Certificate of Completion", W / 2, 305);
+  ctx.strokeStyle = accent; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(W / 2 - 260, 350); ctx.lineTo(W / 2 + 260, 350); ctx.stroke();
+  ctx.fillStyle = soft; ctx.font = "italic 38px Georgia, serif";
+  ctx.fillText("This certifies that", W / 2, 445);
+  ctx.fillStyle = ink; ctx.font = "bold 88px Georgia, serif";
+  ctx.fillText(opts.name, W / 2, 545, W - 320);   // maxWidth squeezes very long names to fit inside the border
+  var nameW = Math.min(W - 320, Math.max(520, Math.min(W - 320, ctx.measureText(opts.name).width) + 140));
+  ctx.strokeStyle = line; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(W / 2 - nameW / 2, 580); ctx.lineTo(W / 2 + nameW / 2, 580); ctx.stroke();
+  ctx.fillStyle = soft; ctx.font = "36px Georgia, serif";
+  ctx.fillText("has successfully completed", W / 2, 650);
+  ctx.fillStyle = accent; ctx.font = "bold 58px Georgia, serif";
+  ctx.fillText(opts.topicTitle, W / 2, 722, W - 320);
+  ctx.fillStyle = soft; ctx.font = "32px Helvetica, Arial, sans-serif";
+  ctx.fillText("Year " + opts.year + " Science" + (opts.strand ? " · " + opts.strand : ""), W / 2, 772, W - 320);
+  var boxes = [
+    [opts.stats.sectionsDone + " / " + opts.stats.sectionsTotal, "Sections completed"],
+    [opts.stats.correct + " / " + opts.stats.answered, "Questions correct"],
+    [String(opts.stats.totalAttempts), "Total attempts"],
+    [opts.stats.firstTryPct + "%", "Right first try"]
+  ];
+  var bw = 360, gap = 28, bh = 175;
+  var bx0 = W / 2 - (boxes.length * bw + (boxes.length - 1) * gap) / 2, by = 835;
+  for (var i = 0; i < boxes.length; i++) {
+    var x = bx0 + i * (bw + gap);
+    ctx.fillStyle = "#f4f6f8"; _rr(ctx, x, by, bw, bh, 14); ctx.fill();
+    ctx.strokeStyle = line; ctx.lineWidth = 2; _rr(ctx, x, by, bw, bh, 14); ctx.stroke();
+    ctx.fillStyle = accent; ctx.font = "bold 62px Georgia, serif"; ctx.textAlign = "center";
+    ctx.fillText(boxes[i][0], x + bw / 2, by + 92);
+    ctx.fillStyle = soft; ctx.font = "27px Helvetica, Arial, sans-serif";
+    ctx.fillText(boxes[i][1], x + bw / 2, by + 140);
+  }
+  ctx.textAlign = "left"; ctx.fillStyle = ink; ctx.font = "bold 34px Helvetica, Arial, sans-serif";
+  ctx.fillText(opts.dateStr, 165, 1175);
+  ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(165, 1130); ctx.lineTo(585, 1130); ctx.stroke();
+  ctx.fillStyle = soft; ctx.font = "26px Helvetica, Arial, sans-serif"; ctx.fillText("Date of completion", 165, 1212);
+  ctx.textAlign = "right"; ctx.fillStyle = ink; ctx.font = "bold 30px 'Courier New', monospace";
+  ctx.fillText(opts.code, W - 165, 1175);
+  ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(W - 585, 1130); ctx.lineTo(W - 165, 1130); ctx.stroke();
+  ctx.fillStyle = soft; ctx.font = "26px Helvetica, Arial, sans-serif"; ctx.fillText("Verification code", W - 165, 1212);
+  var sx = W / 2, sy = 1150, sr = 96;
+  ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI * 2); ctx.fillStyle = accent; ctx.fill();
+  ctx.beginPath(); ctx.arc(sx, sy, sr - 13, 0, Math.PI * 2); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#ffffff"; ctx.textAlign = "center";
+  ctx.font = "bold 27px Helvetica, Arial, sans-serif"; ctx.fillText("VERIFIED", sx, sy - 4);
+  ctx.font = "bold 19px Helvetica, Arial, sans-serif"; ctx.fillText("WHS SCIENCE", sx, sy + 26);
+  var fname = String(opts.topicTitle || "topic").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() + "-certificate.png";
+  function fallbackDownload() {
+    try {
+      var a = document.createElement("a"); a.href = canvas.toDataURL("image/png"); a.download = fname;
+      document.body.appendChild(a); a.click(); setTimeout(function () { a.remove(); }, 1500);
+    } catch (e2) { alert("Sorry, the certificate could not be generated on this device."); }
+  }
+  try {
+    canvas.toBlob(function (blob) {
+      if (!blob) { fallbackDownload(); return; }
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a"); a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { try { URL.revokeObjectURL(url); a.remove(); } catch (e) {} }, 1500);
+    }, "image/png");
+  } catch (e) { fallbackDownload(); }
+}
+
+/* ---------- icons ---------- */
+const Icon = ({ d, size = 18, fill = "none", sw = 2, children }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill={fill} stroke="currentColor"
+       strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round">{d ? <path d={d}/> : children}</svg>
+);
+const IconCheck = (p) => <Icon {...p}><polyline points="20 6 9 17 4 12"/></Icon>;
+const IconX = (p) => <Icon {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></Icon>;
+const IconArrow = (p) => <Icon {...p}><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></Icon>;
+const IconHome = (p) => <Icon {...p}><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></Icon>;
+const IconBook = (p) => <Icon {...p}><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></Icon>;
+const IconGear = (p) => <Icon {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H7a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></Icon>;
+const IconMenu = (p) => <Icon {...p}><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></Icon>;
+const IconSearch = (p) => <Icon {...p}><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></Icon>;
+
+/* ---------- content primitives ---------- */
+/* DotPoints auto-complete: a section that contains auto-markable questions
+   (MCQs) ticks itself once every one of them is answered correctly; a section
+   with no such questions ticks once it has been on screen for about 6 seconds
+   of reading (so fast scrolling or a tall monitor does not tick it). Students
+   can still tick/untick the circle by hand. This is what fills the ring — so
+   simply working through the content now advances progress (it used to require
+   a manual click on every section, which left the bar stuck at 0%). */
+const DotPointContext = React.createContext(null);
+
+function DotPoint({ id, title, children, progress, setProgress }) {
+  const done = !!(progress && progress[id]);
+  const toggle = () => setProgress(p => ({ ...p, [id]: !p[id] }));
+  const reg = useRef({});            // qkey -> true | false | null (null = present but unanswered)
+  const [regTick, setRegTick] = useState(0);
+  const sectionRef = useRef(null);
+
+  const register = useCallback((qkey, ok) => { reg.current[qkey] = ok; setRegTick(t => t + 1); }, []);
+  const unregister = useCallback((qkey) => { delete reg.current[qkey]; setRegTick(t => t + 1); }, []);
+  const ctx = useMemo(() => ({ register, unregister }), [register, unregister]);
+
+  // auto-mark once every registered question is answered correctly
+  useEffect(() => {
+    const vals = Object.values(reg.current);
+    if (vals.length && vals.every(v => v === true)) {
+      setProgress(p => (p[id] ? p : { ...p, [id]: true }));
+    }
+  }, [regTick, id, setProgress]);
+
+  // sections with no auto-markable questions: mark done once scrolled through.
+  // Uses scroll position + getBoundingClientRect rather than IntersectionObserver
+  // so it works for sections TALLER than the viewport and in environments where
+  // innerHeight is unreliable (falls back to a sane viewport height).
+  useEffect(() => {
+    // Poll the section's on-screen position on a timer rather than listening for
+    // scroll events. A timer is reliable everywhere (scroll events can be missed
+    // in some embedded/headless contexts, and requestAnimationFrame is paused in
+    // background tabs); the check itself is a cheap getBoundingClientRect.
+    let done2 = false;
+    let seenMs = 0;                 // time the section has spent on screen
+    const NEED_MS = 6000;
+    const check = () => {
+      if (done2) return true;
+      if (Object.keys(reg.current).length > 0) return true;  // has auto-markable questions: handled above
+      const el = sectionRef.current;
+      if (!el) return false;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+      const r = el.getBoundingClientRect();
+      // count time while the section is in the reading zone (its top above 55%
+      // of the screen and part of it still visible); ignore hidden tabs
+      const visible = r.top < vh * 0.55 && r.bottom > vh * 0.15 && !document.hidden;
+      if (visible) seenMs += 400;
+      if (seenMs >= NEED_MS) {
+        done2 = true;
+        setProgress(p => (p[id] ? p : { ...p, [id]: true }));
+        return true;
+      }
+      return false;
+    };
+    const iv = setInterval(() => { if (check()) clearInterval(iv); }, 400);
+    return () => { clearInterval(iv); };
+  }, [id, setProgress]);
+
+  return (
+    <DotPointContext.Provider value={ctx}>
+      <section className="dot-point" id={"dp-" + id} ref={sectionRef}>
+        <header className="dp-header">
+          <span className="dp-id">{id}</span>
+          <h3 className="dp-title">{title}</h3>
+          <button className={"dp-check" + (done ? " done" : "")} onClick={toggle}
+            aria-label={done ? "Mark as not done" : "Mark as done"} title={done ? "Done" : "Mark as done"}>
+            {done && <IconCheck size={16} sw={3}/>}
+          </button>
+        </header>
+        <div className="dp-body">{children}</div>
+      </section>
+    </DotPointContext.Provider>
+  );
+}
+
+function Callout({ kind = "key", title, children }) {
+  return <div className={"callout " + kind}>{title && <h4>{title}</h4>}{children}</div>;
+}
+
+function Figure({ num, caption, src, alt, children, maxWidth }) {
+  return (
+    <figure className="figure" style={maxWidth ? { maxWidth, marginLeft: "auto", marginRight: "auto" } : undefined}>
+      {src ? <img src={src} alt={alt || caption} loading="lazy"/> : children}
+      {caption && <figcaption className="figure-caption">{num && <strong>Figure {num}. </strong>}{caption}</figcaption>}
+    </figure>
+  );
+}
+
+function Term({ children, def }) {
+  const [show, setShow] = useState(false);
+  const ref = useRef(null);
+  // useId keeps ids unique even when the same term + definition appears more than once on a page
+  const popId = "term-" + useId();
+  useEffect(() => {
+    if (!show) return;
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setShow(false); };
+    const onKey = (e) => { if (e.key === "Escape") setShow(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("touchstart", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("touchstart", onDoc); document.removeEventListener("keydown", onKey); };
+  }, [show]);
+  // rendered as a button so it is keyboard-focusable and tap-toggles on touch;
+  // hover still reveals the definition via CSS for mouse users.
+  return (
+    <button type="button" ref={ref} className={"term" + (show ? " show" : "")}
+      aria-expanded={show} aria-describedby={popId} onClick={() => setShow(s => !s)}>
+      {children}<span className="term-pop" id={popId} role="tooltip">{def}</span>
+    </button>
+  );
+}
+
+function MCQ({ num, question, options, correct, explain }) {
+  const { skey, section } = useContext(TopicContext);
+  const dp = useContext(DotPointContext);
+  const qkey = answerKey(skey, "mcq", num, question);
+  // the chosen answer is saved per question so it survives navigation / refresh
+  const [chosen, setChosen] = useLocalStorage(qkey, null);
+  // cumulative attempts (kept across "Try again") so the certificate can show
+  // how many tries it took to get everything right
+  const [attempts, setAttempts] = useLocalStorage(qkey + ".att", 0);
+  const locked = chosen !== null;
+  // tell the surrounding section whether this question is answered correctly
+  useEffect(() => {
+    if (!dp) return;
+    dp.register(qkey, chosen === null ? null : (chosen === correct));
+    return () => dp.unregister(qkey);
+  }, [dp, qkey, chosen, correct]);
+  const choose = (i) => { setChosen(i); setAttempts(a => (a || 0) + 1); recordMCQResult(skey, qkey, i === correct, section); };
+  const tryAgain = () => { setChosen(null); clearMCQResults(skey, function (_, qk) { return qk === qkey; }); };
+  return (
+    <div className="quiz-card">
+      <div className="quiz-q"><span className="quiz-q-num">{num || "?"}</span><span>{question}</span></div>
+      <div className="quiz-options">
+        {options.map((o, i) => {
+          let cls = "quiz-opt";
+          if (locked && i === correct) cls += " correct";
+          else if (locked && i === chosen) cls += " wrong";
+          return (
+            <button key={i} className={cls} onClick={() => !locked && choose(i)} disabled={locked}>
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, opacity: 0.6, minWidth: 14 }}>{String.fromCharCode(65 + i)}</span>
+              <span style={{ flex: 1 }}>{o}</span>
+              {locked && i === correct && <IconCheck size={16} sw={2.5}/>}
+              {locked && i === chosen && i !== correct && <IconX size={16} sw={2.5}/>}
+            </button>
+          );
+        })}
+      </div>
+      {locked && (
+        <div className="quiz-feedback" role="status" aria-live="polite">
+          {chosen === correct ? "Correct. " : "Not quite. "}{explain}
+          {chosen !== correct && (
+            <div style={{ marginTop: 10 }}>
+              <button className="reveal-btn" onClick={tryAgain}>Try again</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WrittenQ({ num, question, model }) {
+  const { skey } = useContext(TopicContext);
+  // the typed answer is saved so it is never lost on navigation / refresh
+  const [val, setVal] = useLocalStorage(answerKey(skey, "wq", num, question), "");
+  const [show, setShow] = useState(false);
+  return (
+    <div className="quiz-card">
+      <div className="quiz-q"><span className="quiz-q-num">{num || "?"}</span><span>{question}</span></div>
+      <textarea className="response-box" value={val} onChange={e => setVal(e.target.value)} placeholder="Type your answer here…" aria-label={"Your answer" + (num ? " to question " + num : "")}/>
+      {model && <>
+        <button className="reveal-btn" onClick={() => setShow(s => !s)} aria-expanded={show}>{show ? "Hide model answer" : "Show model answer"}</button>
+        {show && <div className="model-answer" role="region" aria-label="Model answer"><strong>Model answer. </strong>{model}</div>}
+      </>}
+    </div>
+  );
+}
+
+function QGroup({ title, children }) {
+  return (
+    <div className="q-group">
+      <div className="q-group-title"><span className="kicker">Check yourself</span><h4 style={{ margin: 0 }}>{title}</h4></div>
+      {children}
+    </div>
+  );
+}
+
+function Interactive({ title, subtitle, takeaway, children }) {
+  return (
+    <div className="interactive">
+      <div className="interactive-label">Interactive</div>
+      {title && <div className="interactive-title">{title}</div>}
+      {subtitle && <div className="interactive-sub">{subtitle}</div>}
+      {children}
+      {takeaway && <div className="interactive-takeaway"><strong>What this shows. </strong>{takeaway}</div>}
+    </div>
+  );
+}
+
+/* ---------- interactive building blocks ---------- */
+function Slider({ label, min, max, step = 1, value, onChange, unit = "", fmt }) {
+  const sid = "sl-" + useId();
+  return (
+    <div className="ctrl">
+      <label htmlFor={sid}>{label}<span className="val">{fmt ? fmt(value) : value}{unit}</span></label>
+      <input id={sid} type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))}/>
+    </div>
+  );
+}
+function SegToggle({ options, value, onChange }) {
+  return (
+    <div className="seg-toggle">
+      {options.map(o => {
+        const val = typeof o === "object" ? o.value : o;
+        const lab = typeof o === "object" ? o.label : o;
+        return <button key={val} type="button" className={value === val ? "on" : ""} aria-pressed={value === val} onClick={() => onChange(val)}>{lab}</button>;
+      })}
+    </div>
+  );
+}
+function Stat({ value, label }) {
+  return <div className="stat"><div className="stat-val">{value}</div><div className="stat-label">{label}</div></div>;
+}
+function Reveal({ children, label = "Reveal hidden answer" }) {
+  const [shown, setShown] = useState(false);
+  // a real button so it is keyboard-focusable and operable with Enter/Space
+  return (
+    <button type="button" className={"reveal-blur" + (shown ? " shown" : "")}
+      onClick={() => setShown(true)} aria-expanded={shown} aria-label={shown ? undefined : label}>
+      {children}
+    </button>
+  );
+}
+function FlipCard({ front, back }) {
+  const [f, setF] = useState(false);
+  return (
+    <button type="button" className="card" style={{ cursor: "pointer", minHeight: 90, textAlign: "left", width: "100%" }} aria-pressed={f} onClick={() => setF(v => !v)}>
+      <div style={{ fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--ink-muted)", marginBottom: 6 }}>{f ? "Answer" : "Tap to flip"}</div>
+      <div>{f ? back : front}</div>
+    </button>
+  );
+}
+/* drag-to-bucket matching: items = [{id,label,bucket}], buckets=[{id,label}] */
+function MatchBuckets({ items, buckets }) {
+  const [placed, setPlaced] = useState({});
+  const [drag, setDrag] = useState(null);
+  const [over, setOver] = useState(null);
+  const allPlaced = items.every(it => placed[it.id]);
+  const allCorrect = allPlaced && items.every(it => placed[it.id] === it.bucket);
+  const drop = (b) => { if (drag) { setPlaced(p => ({ ...p, [drag]: b })); setDrag(null); setOver(null); } };
+  // keyboard: Enter / Space act like a click on chips and drop zones
+  const keyAct = (fn) => (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(e); } };
+  const pick = (id) => setDrag(d => (d === id ? null : id));
+  const unplace = (id) => setPlaced(p => { const n = { ...p }; delete n[id]; return n; });
+  return (
+    <div>
+      <div className="row" style={{ marginBottom: 14 }}>
+        {items.filter(it => !placed[it.id]).map(it => (
+          <span key={it.id} className="drag-chip" draggable role="button" tabIndex={0} aria-pressed={drag === it.id}
+            aria-label={it.label + (drag === it.id ? " (selected, now choose a group)" : ". Press Enter to pick up, then choose a group.")}
+            onDragStart={() => setDrag(it.id)} onDragEnd={() => { setDrag(null); setOver(null); }}
+            onClick={() => pick(it.id)} onKeyDown={keyAct(() => pick(it.id))}
+            style={drag === it.id ? { borderColor: "var(--accent)", boxShadow: "var(--shadow-2)" } : {}}>{it.label}</span>
+        ))}
+        {allPlaced && <span className="chip ok">All placed</span>}
+      </div>
+      <div className="grid-2">
+        {buckets.map(b => (
+          <div key={b.id} className={"drop-zone" + (over === b.id ? " over" : "")} role="group" aria-label={"Group: " + b.label}
+            tabIndex={drag ? 0 : undefined}
+            onDragOver={e => { e.preventDefault(); setOver(b.id); }} onDragLeave={() => setOver(null)} onDrop={() => drop(b.id)}
+            onClick={() => drag && drop(b.id)} onKeyDown={e => { if (e.target === e.currentTarget) keyAct(() => drop(b.id))(e); }}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>{b.label}</div>
+            <div className="row">
+              {items.filter(it => placed[it.id] === b.id).map(it => {
+                const ok = it.bucket === b.id;
+                return <span key={it.id} className="drag-chip" role="button" tabIndex={0}
+                  aria-label={it.label + (ok ? ", correct" : ", incorrect") + ". Press Enter to move it back."}
+                  style={{ borderColor: ok ? "var(--green-deep)" : "var(--red)", background: ok ? "var(--green-soft)" : "var(--red-soft)" }}
+                  onClick={e => { e.stopPropagation(); unplace(it.id); }}
+                  onKeyDown={e => { e.stopPropagation(); keyAct(() => unplace(it.id))(e); }}>{it.label} {ok ? "✓" : "✕"}</span>;
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      {allPlaced && <div className="quiz-feedback" role="status" aria-live="polite" style={{ marginTop: 12 }}>{allCorrect ? "Every item is in the right place. Well done." : "Some items are misplaced. Tap a placed chip to send it back and try again."}</div>}
+    </div>
+  );
+}
+
+/* ---------- progress ring ---------- */
+function Ring({ pct, size = 22, sw = 2.5, stroke = "var(--accent)" }) {
+  const r = (size - sw) / 2 - 0.5, c = 2 * Math.PI * r;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true" focusable="false">
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="var(--border)" strokeWidth={sw}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={stroke} strokeWidth={sw}
+        strokeDasharray={`${(pct/100)*c} ${c}`} transform={`rotate(-90 ${size/2} ${size/2})`} strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+/* ============================================================ App shell */
+function buildApp(CFG) {
+  const SECTIONS = CFG.sections;
+  const ALL_POINTS = SECTIONS.flatMap(s => s.points || []);
+  const SKEY = CFG.storageKey;
+
+  function CompletionPanel({ progress }) {
+    const [name, setName] = useLocalStorage("jsci.studentname", "");
+    const done = ALL_POINTS.filter(p => progress[p]).length;
+    const total = ALL_POINTS.length;
+    if (!total || done < total) return null;          // only when the topic is 100% complete
+    const stats = gatherTopicStats(SKEY, done, total);
+    if (!stats.answered) return (
+      <section style={{ marginTop: 30 }}>
+        <div className="card" style={{ borderLeft: "5px solid var(--accent)" }}>
+          <h3 style={{ margin: 0, fontSize: "1.2rem" }}>Almost there — answer the quizzes</h3>
+          <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.92rem" }}>You've been through every section. Answer the quiz questions to unlock your certificate.</p>
+        </div>
+      </section>
+    );
+    const make = () => {
+      const nm = (name || "").trim();
+      if (!nm) { alert("Please type your name so it can appear on the certificate."); return; }
+      const now = new Date();
+      const dateStr = now.toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+      const accent = BRANCH_ACCENT[CFG.branch] || BRANCH_ACCENT.general;
+      downloadCertificatePNG({
+        name: nm, code: certCode(nm, SKEY, stats), stats: stats,
+        topicTitle: CFG.topicTitle, year: CFG.year, strand: CFG.strand, dateStr: dateStr, accent: accent
+      });
+    };
+    return (
+      <section style={{ marginTop: 30 }}>
+        <div className="card" style={{ borderLeft: "5px solid var(--accent)" }}>
+          <div className="row" style={{ alignItems: "center", gap: 14 }}>
+            <div style={{ fontSize: 42, lineHeight: 1 }}>🎓</div>
+            <div>
+              <h3 style={{ margin: 0, fontSize: "1.3rem" }}>Topic complete — get your certificate</h3>
+              <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.92rem" }}>You've finished all {total} sections. Download a certificate (PNG image, watermarked, with a verification code) as proof of work — it shows your quiz score and how many attempts it took.</p>
+            </div>
+          </div>
+          <div className="row" style={{ marginTop: 14, gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <input className="gloss-search" style={{ maxWidth: 320, margin: 0 }} placeholder="Type your full name" value={name} onChange={e => setName(e.target.value)} aria-label="Your name for the certificate"/>
+            <button className="btn btn-accent" onClick={make}>Download certificate (PNG)</button>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  function Home({ progress, goTo }) {
+    const done = ALL_POINTS.filter(p => progress[p]).length;
+    const pct = ALL_POINTS.length ? Math.round(100 * done / ALL_POINTS.length) : 0;
+    const cont = useMemo(() => {
+      const ip = SECTIONS.find(s => { const d = (s.points||[]).filter(p => progress[p]).length; return d > 0 && d < s.points.length; });
+      if (ip) return ip;
+      return SECTIONS.find(s => (s.points||[]).every(p => !progress[p])) || SECTIONS[0];
+    }, [progress]);
+    const ctaLabel = done === 0 ? "Start learning" : done === ALL_POINTS.length ? "Review everything" : "Continue where you left off";
+    return (
+      <div className="fade-in">
+        <section className="topic-head" style={{ marginBottom: 28 }}>
+          <div className="eyebrow">Year {CFG.year} Science · {CFG.strand || "NSW Syllabus"}</div>
+          <h1>{CFG.topicTitle}</h1>
+          <p className="lead">{CFG.intro}</p>
+          {CFG.heroImage && (
+            <img src={CFG.heroImage} alt={CFG.topicTitle} loading="lazy"
+              style={{ width: "100%", display: "block", marginTop: 20, borderRadius: 14, border: "2px solid var(--border-strong)", boxShadow: "6px 6px 0 var(--border-strong)" }} />
+          )}
+          <div className="row" style={{ marginTop: 22, alignItems: "center" }}>
+            <button className="btn btn-accent" onClick={() => goTo(cont.id)}>{ctaLabel} <IconArrow size={16} sw={2.5}/></button>
+            {CFG.hubHref && <a className="btn btn-ghost" href={CFG.hubHref}>← All Year {CFG.year} topics</a>}
+            <a className="btn btn-ghost" href="/">⌂ All year groups</a>
+            <div className="spacer"/>
+            <div className="row" style={{ alignItems: "center", gap: 10 }}>
+              <Ring pct={pct} size={46} sw={5}/>
+              <div><div style={{ fontWeight: 700 }}>{done} of {ALL_POINTS.length}</div><div className="muted" style={{ fontSize: "0.8rem" }}>sections complete</div></div>
+            </div>
+          </div>
+        </section>
+
+        <div className="grid-2">
+          {SECTIONS.map(s => {
+            const d = (s.points||[]).filter(p => progress[p]).length;
+            const sp = s.points && s.points.length ? Math.round(100 * d / s.points.length) : 0;
+            return (
+              <button key={s.id} className="card" style={{ textAlign: "left", cursor: "pointer", borderLeft: "5px solid var(--accent)", display: "flex", flexDirection: "column", gap: 8 }} onClick={() => goTo(s.id)}>
+                <div className="between"><span className="chip accent">{s.id}</span><span className="muted" style={{ fontSize: "0.8rem", fontVariantNumeric: "tabular-nums" }}>{d}/{(s.points||[]).length}</span></div>
+                <h3 style={{ fontSize: "1.3rem" }}>{s.label}</h3>
+                {s.blurb && <p className="muted" style={{ fontSize: "0.92rem", margin: 0 }}>{s.blurb}</p>}
+                <div className="progressbar" style={{ marginTop: 4 }}><div style={{ width: sp + "%", background: "var(--accent)" }}/></div>
+                <div className="sec-open" style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600, fontSize: "0.88rem", marginTop: 4 }}>Open section <IconArrow size={14} sw={2.5}/></div>
+              </button>
+            );
+          })}
+        </div>
+
+        {(() => {
+          const r = readMCQResults(SKEY);
+          const vals = Object.values(r);
+          if (!vals.length) return null;
+          const answered = vals.length;
+          const ok = vals.filter(v => v && v.ok).length;
+          const wrong = answered - ok;
+          return (
+            <section style={{ marginTop: 30 }}>
+              <div className="card between" style={{ alignItems: "center" }}>
+                <div>
+                  <h3 style={{ fontSize: "1.2rem", margin: 0 }}>Your quiz results</h3>
+                  <p className="muted" style={{ margin: "4px 0 0", fontSize: "0.92rem" }}>{ok} of {answered} correct{wrong > 0 ? ` · ${wrong} to revisit` : ""}.</p>
+                </div>
+                <button className="btn btn-accent" onClick={() => goTo("review")}>Review{wrong > 0 ? ` (${wrong})` : ""} <IconArrow size={15} sw={2.5}/></button>
+              </div>
+            </section>
+          );
+        })()}
+
+        <CompletionPanel progress={progress}/>
+
+        <section style={{ marginTop: 32 }}>
+          <h2 style={{ marginBottom: 6 }}>How to use this site</h2>
+          <p className="muted">Read a little, play a little, then check yourself. Everything saves automatically in this browser.</p>
+          <div className="grid-3" style={{ marginTop: 14 }}>
+            <div className="card"><h4>1 · Explore</h4><p className="muted" style={{ margin: 0, fontSize: "0.9rem" }}>Open any section from the tabs at the top. Read the short explanations and hover highlighted words for definitions.</p></div>
+            <div className="card"><h4>2 · Play</h4><p className="muted" style={{ margin: 0, fontSize: "0.9rem" }}>Every section has simulations and models you can change. Move sliders, drag things, watch what happens.</p></div>
+            <div className="card"><h4>3 · Check as you go</h4><p className="muted" style={{ margin: 0, fontSize: "0.9rem" }}>Answer the questions for instant feedback — your progress ring fills automatically as you work through each section.</p></div>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function TopicNav({ id, goTo }) {
+    const i = SECTIONS.findIndex(s => s.id === id);
+    const prev = i > 0 ? SECTIONS[i-1] : null, next = i < SECTIONS.length-1 ? SECTIONS[i+1] : null;
+    return (
+      <nav className="topic-nav">
+        {prev ? <button className="topic-nav-btn prev" onClick={() => goTo(prev.id)}><span className="topic-nav-dir">← Previous</span><span className="topic-nav-id">{prev.id}</span><span className="topic-nav-label">{prev.label}</span></button> : <div/>}
+        {next ? <button className="topic-nav-btn next" onClick={() => goTo(next.id)}><span className="topic-nav-dir">Next →</span><span className="topic-nav-id">{next.id}</span><span className="topic-nav-label">{next.label}</span></button> : <div/>}
+      </nav>
+    );
+  }
+
+  function GlossaryModal({ onClose }) {
+    const [q, setQ] = useState("");
+    const modalRef = useRef(null);
+    const lastFocused = useRef(null);
+    const entries = useMemo(() => {
+      const all = Object.entries(CFG.glossary || {}).sort((a, b) => a[0].localeCompare(b[0]));
+      if (!q.trim()) return all;
+      const n = q.toLowerCase();
+      return all.filter(([t, d]) => t.toLowerCase().includes(n) || String(d).toLowerCase().includes(n));
+    }, [q]);
+    // remember the opener once and return focus to it when the modal closes
+    useEffect(() => {
+      lastFocused.current = document.activeElement;
+      return () => { try { lastFocused.current && lastFocused.current.focus(); } catch {} };
+    }, []);
+    // onClose is a fresh function every parent render, so keep it in a ref and
+    // register the key handler only once
+    const closeRef = useRef(onClose);
+    closeRef.current = onClose;
+    useEffect(() => {
+      const onKey = (e) => {
+        if (e.key === "Escape") { closeRef.current(); return; }
+        if (e.key === "Tab" && modalRef.current) {
+          // simple focus trap
+          const f = modalRef.current.querySelectorAll('button, input, [href], textarea, [tabindex]:not([tabindex="-1"])');
+          if (!f.length) return;
+          const first = f[0], last = f[f.length - 1];
+          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      };
+      document.addEventListener("keydown", onKey);
+      return () => document.removeEventListener("keydown", onKey);
+    }, []);
+    return (
+      <div className="modal-scrim" onClick={onClose}>
+        <div className="modal" ref={modalRef} role="dialog" aria-modal="true" aria-label="Glossary" onClick={e => e.stopPropagation()}>
+          <div className="modal-header"><h2 style={{ fontSize: "1.4rem" }}>Glossary</h2><button className="icon-btn" onClick={onClose} aria-label="Close glossary"><IconX/></button></div>
+          <input className="gloss-search" placeholder="Search terms…" value={q} onChange={e => setQ(e.target.value)} autoFocus/>
+          <dl className="gloss-list">
+            {entries.map(([t, d]) => <div className="gloss-entry" key={t}><dt>{t}</dt><dd>{d}</dd></div>)}
+            {!entries.length && <p className="muted center" style={{ padding: 20 }}>No matches.</p>}
+          </dl>
+        </div>
+      </div>
+    );
+  }
+
+  function SearchModal({ onClose, goTo }) {
+    const [q, setQ] = useState("");
+    const modalRef = useRef(null);
+    const lastFocused = useRef(null);
+    // remember the opener once and return focus to it when the modal closes
+    useEffect(() => {
+      lastFocused.current = document.activeElement;
+      return () => { try { lastFocused.current && lastFocused.current.focus(); } catch {} };
+    }, []);
+    // onClose is a fresh function every parent render, so keep it in a ref and
+    // register the key handler only once
+    const closeRef = useRef(onClose);
+    closeRef.current = onClose;
+    useEffect(() => {
+      const onKey = (e) => {
+        if (e.key === "Escape") { closeRef.current(); return; }
+        if (e.key === "Tab" && modalRef.current) {
+          const f = modalRef.current.querySelectorAll('button, input, [href], [tabindex]:not([tabindex="-1"])');
+          if (!f.length) return;
+          const first = f[0], last = f[f.length - 1];
+          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      };
+      document.addEventListener("keydown", onKey);
+      return () => document.removeEventListener("keydown", onKey);
+    }, []);
+    const n = q.trim().toLowerCase();
+    const secHits = !n ? [] : SECTIONS.filter(s => ((s.label || "") + " " + (s.blurb || "") + " " + s.id).toLowerCase().includes(n));
+    const glossHits = !n ? [] : Object.entries(CFG.glossary || {}).filter(([t, d]) => (t + " " + d).toLowerCase().includes(n)).slice(0, 10);
+    const go = (id) => { onClose(); goTo(id); };
+    return (
+      <div className="modal-scrim" onClick={onClose}>
+        <div className="modal" ref={modalRef} role="dialog" aria-modal="true" aria-label="Search this topic" onClick={e => e.stopPropagation()}>
+          <div className="modal-header"><h2 style={{ fontSize: "1.4rem" }}>Search this topic</h2><button className="icon-btn" onClick={onClose} aria-label="Close search"><IconX/></button></div>
+          <input className="gloss-search" placeholder="Search section topics and key terms…" value={q} onChange={e => setQ(e.target.value)} autoFocus/>
+          <div className="gloss-list">
+            {!n && <p className="muted" style={{ padding: "4px 2px" }}>Type to search section topics and glossary terms.</p>}
+            {n && !secHits.length && !glossHits.length && <p className="muted center" style={{ padding: 20 }}>No matches.</p>}
+            {secHits.length > 0 && <div style={{ marginBottom: 10 }}>
+              <div className="search-group-h">Sections</div>
+              {secHits.map(s => (
+                <button key={s.id} className="search-hit" onClick={() => go(s.id)}>
+                  <span className="chip accent">{s.id}</span>
+                  <span><strong>{s.label}</strong>{s.blurb ? <span className="muted"> — {s.blurb}</span> : null}</span>
+                </button>
+              ))}
+            </div>}
+            {glossHits.length > 0 && <div>
+              <div className="search-group-h">Key terms</div>
+              <dl style={{ margin: 0 }}>
+                {glossHits.map(([t, d]) => <div className="gloss-entry" key={t}><dt>{t}</dt><dd>{d}</dd></div>)}
+              </dl>
+            </div>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function Review({ goTo }) {
+    const results = readMCQResults(SKEY);
+    const entries = Object.entries(results);
+    const answered = entries.length;
+    const correct = entries.filter(([, v]) => v && v.ok).length;
+    const wrong = entries.filter(([, v]) => v && v.ok === false);
+    const bySection = {};
+    wrong.forEach(([k, v]) => { const sid = v.section || "?"; (bySection[sid] = bySection[sid] || []).push(k); });
+    const sectionLabel = (id) => { const s = SECTIONS.find(x => x.id === id); return s ? s.label : id; };
+    const retrySection = (sid) => {
+      (bySection[sid] || []).forEach(k => { try { localStorage.removeItem(k); } catch {} });
+      clearMCQResults(SKEY, (v) => (v.section || "?") === sid && v.ok === false);
+      if (SECTIONS.find(x => x.id === sid)) goTo(sid); else goTo("home");
+    };
+    return (
+      <div className="fade-in">
+        <section className="topic-head" style={{ marginBottom: 24 }}>
+          <div className="eyebrow">Check your understanding</div>
+          <h1>Review</h1>
+          <p className="lead">
+            {answered === 0
+              ? "You haven't answered any quiz questions yet. Work through the sections and your results will show up here."
+              : `You've answered ${answered} quiz question${answered === 1 ? "" : "s"} — ${correct} correct.`}
+          </p>
+          <div className="row" style={{ marginTop: 16 }}>
+            <button className="btn btn-ghost" onClick={() => goTo("home")}>← Back to overview</button>
+          </div>
+        </section>
+        {wrong.length === 0 ? (
+          answered > 0 && <Callout kind="success" title="Nothing to review">Nice work — you've answered every question correctly so far.</Callout>
+        ) : (
+          <>
+            <h2 style={{ marginBottom: 6 }}>Questions to revisit</h2>
+            <p className="muted">These are the sections where you got a question wrong. Retry resets those questions so you can have another go.</p>
+            <div className="col" style={{ marginTop: 14 }}>
+              {Object.keys(bySection).map(sid => (
+                <div key={sid} className="card between">
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{sectionLabel(sid)}</div>
+                    <div className="muted" style={{ fontSize: "0.86rem" }}>{bySection[sid].length} to revisit</div>
+                  </div>
+                  <div className="row" style={{ gap: 8 }}>
+                    <button className="btn btn-ghost btn-sm" onClick={() => goTo(sid)}>Go to section</button>
+                    <button className="btn btn-accent btn-sm" onClick={() => retrySection(sid)}>Retry these <IconArrow size={14} sw={2.5}/></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  return function App() {
+    const [progressRaw, setProgress] = useLocalStorage(SKEY + ".progress", {});
+    const progress = progressRaw && typeof progressRaw === "object" ? progressRaw : {};   // guard against a corrupted stored value
+    const [size, setSize] = useLocalStorage("jsci.size", "md");
+    const [dark, setDark] = useLocalStorage("jsci.dark", false);
+    const [dys, setDys] = useLocalStorage("jsci.dyslexic", false);
+    const [view, setView] = useState("home");
+    const [setOpen, setSetOpen] = useState(false);
+    const [glOpen, setGlOpen] = useState(false);
+    const [searchOpen, setSearchOpen] = useState(false);
+    const [mob, setMob] = useState(false);
+    const scroller = useRef(null);
+
+    useEffect(() => {
+      const r = document.documentElement;
+      r.dataset.theme = dark ? "dark" : "light";
+      r.dataset.size = size;
+      r.dataset.dyslexic = dys ? "true" : "false";
+      r.dataset.branch = CFG.branch || "general";
+    }, [dark, size, dys]);
+
+    useEffect(() => {
+      const fromHash = () => {
+        const h = decodeURIComponent(window.location.hash.replace("#", ""));
+        if (!h || h === "home") { setView("home"); return; }
+        if (h === "review" || SECTIONS.find(s => s.id === h)) setView(h);
+      };
+      fromHash();
+      window.addEventListener("hashchange", fromHash);
+      return () => window.removeEventListener("hashchange", fromHash);
+    }, []);
+    useEffect(() => { window.scrollTo({ top: 0, behavior: "instant" }); setMob(false); }, [view]);
+
+    // close the settings popover on Escape or a click/tap outside it
+    useEffect(() => {
+      if (!setOpen) return;
+      const onKey = (e) => { if (e.key === "Escape") setSetOpen(false); };
+      const onDown = (e) => { if (!e.target.closest(".settings-pop") && !e.target.closest("[data-settings-toggle]")) setSetOpen(false); };
+      document.addEventListener("keydown", onKey);
+      document.addEventListener("mousedown", onDown);
+      document.addEventListener("touchstart", onDown);
+      return () => { document.removeEventListener("keydown", onKey); document.removeEventListener("mousedown", onDown); document.removeEventListener("touchstart", onDown); };
+    }, [setOpen]);
+
+    const clearProgress = () => {
+      if (!confirm("Reset all progress and saved answers for this topic?")) return;
+      try {
+        localStorage.setItem(SKEY + ".progress", "{}");
+        Object.keys(localStorage).forEach(k => {
+          if (k.indexOf(SKEY + ".mcq.") === 0 || k.indexOf(SKEY + ".wq.") === 0 || k === SKEY + ".results") localStorage.removeItem(k);
+        });
+        // .att attempt counters share the .mcq key prefix, so they are cleared above
+      } catch {}
+      // reload so answered quizzes / typed answers already on screen reset too
+      // (their state lives in memory, not just in localStorage)
+      location.reload();
+    };
+
+    // Carry progress between devices: export every key for this topic as a
+    // shareable code, and import it back. No account / server needed.
+    const exportProgress = () => {
+      try {
+        const data = {};
+        Object.keys(localStorage).forEach(k => { if (k.indexOf(SKEY) === 0) data[k] = localStorage.getItem(k); });
+        const code = btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+        try { if (navigator.clipboard) navigator.clipboard.writeText(code); } catch {}
+        window.prompt("Your progress code (copied to clipboard). On another device, choose “Load progress code” and paste it.", code);
+      } catch (e) { alert("Sorry, a progress code could not be created on this device."); }
+    };
+    const importProgress = () => {
+      const code = window.prompt("Paste your progress code here:");
+      if (!code) return;
+      try {
+        const data = JSON.parse(decodeURIComponent(escape(atob(code.trim()))));
+        Object.keys(data).forEach(k => { if (k.indexOf(SKEY) === 0) localStorage.setItem(k, data[k]); });
+        alert("Progress loaded. The page will now reload.");
+        location.reload();
+      } catch (e) { alert("That code didn't look right — please check you copied all of it and try again."); }
+    };
+
+    // Shared/library computer: wipe saved progress + answers for EVERY topic on
+    // this device so the next student starts clean. Keeps display settings.
+    // No accounts, no passwords — just clears this browser's local data.
+    const clearDevice = () => {
+      if (!confirm("Start fresh on this device?\n\nThis clears saved progress and answers for ALL topics on this computer (your display settings are kept). Use this on a shared/library computer. It can't be undone.")) return;
+      try { Object.keys(localStorage).forEach(k => { if (/^y\d+\./.test(k)) localStorage.removeItem(k); }); } catch {}
+      location.reload();
+    };
+
+    const goTo = (id) => { window.location.hash = id; setView(id); };
+    const done = ALL_POINTS.filter(p => progress[p]).length;
+    const pct = ALL_POINTS.length ? Math.round(100 * done / ALL_POINTS.length) : 0;
+    const sec = SECTIONS.find(s => s.id === view);
+    const ctxVal = useMemo(() => ({ skey: SKEY, section: view }), [view]);
+
+    return (
+      <TopicContext.Provider value={ctxVal}>
+      <div className="app">
+        <header className="topbar">
+          <div className="brand">
+            {CFG.hubHref
+              ? <a className="brand-mark" href={CFG.hubHref} aria-label={"All Year " + CFG.year + " topics"}>{(CFG.topicTitle || "?").trim().charAt(0).toUpperCase()}</a>
+              : <button className="brand-mark" onClick={() => goTo("home")} aria-label="Home">{(CFG.topicTitle || "?").trim().charAt(0).toUpperCase()}</button>}
+            <div><div className="brand-title">{CFG.topicTitle}</div><div className="brand-sub">Year {CFG.year} notebook</div></div>
+          </div>
+          <nav className="tabs" aria-label="Sections">
+            <button className={"tab" + (view === "home" ? " active" : "")} aria-current={view === "home" ? "page" : undefined} onClick={() => goTo("home")}><IconHome size={15}/><span>Overview</span></button>
+            {SECTIONS.map(s => (
+              <button key={s.id} className={"tab" + (view === s.id ? " active" : "")} aria-current={view === s.id ? "page" : undefined} onClick={() => goTo(s.id)}>
+                <span className="tab-id">{s.id}</span><span>{s.label}</span>
+                <span className="tab-progress">{(s.points||[]).filter(p => progress[p]).length}/{(s.points||[]).length}</span>
+              </button>
+            ))}
+          </nav>
+          <div className="topbar-actions">
+            <div className="progress-chip" title={`${done} of ${ALL_POINTS.length} complete`}><div className="progress-ring"><Ring pct={pct}/></div><span className="progress-text">{pct}%</span></div>
+            <button className="icon-btn" onClick={() => setSearchOpen(true)} aria-label="Search this topic" title="Search"><IconSearch/></button>
+            {CFG.glossary && <button className="icon-btn" onClick={() => setGlOpen(true)} aria-label="Glossary" title="Glossary"><IconBook/></button>}
+            <button className="icon-btn" data-settings-toggle onClick={() => setSetOpen(o => !o)} aria-label="Reading settings" aria-expanded={setOpen} title="Reading settings"><IconGear/></button>
+            <button className="icon-btn mobile-only" onClick={() => setMob(m => !m)} aria-label="Menu"><IconMenu/></button>
+            {setOpen && (
+              <div className="settings-pop" role="dialog" aria-label="Reading settings">
+                <div className="settings-row"><label>Theme</label><div className="seg"><button className={!dark ? "on" : ""} onClick={() => setDark(false)}>Light</button><button className={dark ? "on" : ""} onClick={() => setDark(true)}>Dark</button></div></div>
+                <div className="settings-row"><label>Text size</label><div className="seg">{["sm","md","lg","xl"].map(s => <button key={s} className={size === s ? "on" : ""} onClick={() => setSize(s)} style={{ fontSize: { sm: 11, md: 13, lg: 15, xl: 17 }[s] }}>A</button>)}</div></div>
+                <div className="settings-row"><label>Readable font</label><div className="seg"><button className={!dys ? "on" : ""} onClick={() => setDys(false)}>Default</button><button className={dys ? "on" : ""} onClick={() => setDys(true)}>Hyperlegible</button></div></div>
+                <div className="settings-row"><label>Print this topic</label><button className="ghost-btn" onClick={() => window.print()}>Print</button></div>
+                <div className="settings-row"><label>Save progress code</label><button className="ghost-btn" onClick={exportProgress}>Copy</button></div>
+                <div className="settings-row"><label>Load progress code</label><button className="ghost-btn" onClick={importProgress}>Paste</button></div>
+                <div className="settings-row"><label>Reset progress</label><button className="danger-btn" onClick={clearProgress}>Reset</button></div>
+                <div className="settings-row"><label>Start fresh (shared computer)</label><button className="danger-btn" onClick={clearDevice}>Clear device</button></div>
+              </div>
+            )}
+          </div>
+        </header>
+
+        {mob && (
+          <div className="mobile-drawer" onClick={() => setMob(false)}>
+            <div className="mobile-drawer-inner" onClick={e => e.stopPropagation()}>
+              <button className={"mobile-tab" + (view === "home" ? " active" : "")} onClick={() => goTo("home")}><span className="tab-id">⌂</span><span className="tab-label">Overview</span></button>
+              {SECTIONS.map(s => <button key={s.id} className={"mobile-tab" + (view === s.id ? " active" : "")} onClick={() => goTo(s.id)}><span className="tab-id">{s.id}</span><span className="tab-label">{s.label}</span><span className="tab-progress">{(s.points||[]).filter(p => progress[p]).length}/{(s.points||[]).length}</span></button>)}
+              {CFG.hubHref && <a className="mobile-tab" href={CFG.hubHref} style={{ marginTop: 8 }}><span className="tab-id">↩</span><span className="tab-label">All Year {CFG.year} topics</span></a>}
+              <a className="mobile-tab" href="/"><span className="tab-id">⌂</span><span className="tab-label">All year groups</span></a>
+            </div>
+          </div>
+        )}
+
+        <main className="main-scroll" ref={scroller}>
+          <div className="content-wrap">
+            {view === "home" && <Home progress={progress} goTo={goTo}/>}
+            {view === "review" && <Review goTo={goTo}/>}
+            {sec && <div className="fade-in">{sec.render({ progress, setProgress })}</div>}
+            {sec && <TopicNav id={view} goTo={goTo}/>}
+            <footer className="site-footer">
+              <div>Year {CFG.year} Science · {CFG.topicTitle} · Built for self-paced learning with UDL 3.0 principles: multiple means of representation, engagement, and action and expression.</div>
+              <div>Your progress saves automatically in this browser. Use the gear icon for dark mode, larger text, or a more readable font.</div>
+            </footer>
+          </div>
+        </main>
+
+        {glOpen && <GlossaryModal onClose={() => setGlOpen(false)}/>}
+        {searchOpen && <SearchModal onClose={() => setSearchOpen(false)} goTo={goTo}/>}
+      </div>
+      </TopicContext.Provider>
+    );
+  };
+}
+
+function mountTopicApp(CFG) {
+  const App = buildApp(CFG);
+  ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  try { window.__mounted = true; } catch {}
+}
+
+Object.assign(window, {
+  useLocalStorage, useReducedMotion, TopicContext, hashStr, answerKey,
+  Icon, IconCheck, IconX, IconArrow, IconHome, IconBook, IconGear, IconMenu,
+  DotPoint, Callout, Figure, Term, MCQ, WrittenQ, QGroup, Interactive,
+  Slider, SegToggle, Stat, Reveal, FlipCard, MatchBuckets, Ring,
+  buildApp, mountTopicApp,
+});

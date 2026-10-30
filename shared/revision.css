@@ -1,0 +1,43 @@
+/* Revision blocks (see revision.jsx). Uses kit.css variables so dark mode follows. */
+.exam-focus { display: flex; gap: 12px; align-items: flex-start; padding: 10px 14px; margin: 0 0 16px; border-radius: 11px; border: 1.5px solid var(--border-strong); background: var(--bg-2); font-size: 0.9rem; }
+.exam-focus .ef-stars { font-size: 1rem; letter-spacing: 1px; line-height: 1.4; white-space: nowrap; color: var(--amber); }
+.exam-focus.tier-core { border-color: var(--amber); background: color-mix(in srgb, var(--amber) 12%, var(--card)); }
+.exam-focus.tier-know .ef-stars { color: var(--ink-muted); }
+
+.recap ul { margin: 6px 0 0; padding-left: 1.2em; }
+.recap li { margin: 4px 0; }
+
+.worked { margin: 18px 0; padding: 14px 16px; border-radius: 14px; border: 1.5px solid var(--ink); background: var(--card); box-shadow: 3px 3px 0 var(--ink); }
+.worked-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.worked-head h4 { margin: 0; }
+.worked .kicker, .selfcheck .kicker { font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); font-weight: 600; }
+.worked-problem { font-size: 0.95rem; }
+.worked-steps { margin: 12px 0 0; padding-left: 1.4em; }
+.worked-steps li { margin: 6px 0; }
+.worked-answer { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: var(--accent-soft); border-left: 4px solid var(--accent-deep); }
+.worked-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+.selfcheck { margin-top: 22px; padding: 14px 16px; border-radius: 14px; border: 1.5px dashed var(--border-strong); background: var(--bg-2); }
+.selfcheck ul { list-style: none; margin: 0; padding: 0; }
+.selfcheck li { margin: 6px 0; }
+.selfcheck label { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.selfcheck input { margin-top: 4px; width: 18px; height: 18px; flex: none; accent-color: var(--accent-deep); }
+.selfcheck-done { margin: 10px 0 0; font-weight: 600; color: var(--accent-deep); }
+[data-theme="dark"] .selfcheck-done { color: var(--ink); }
+
+.nb-link { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 8px 14px; border-radius: 999px; border: 1.5px solid var(--ink); background: var(--bg-2); color: var(--ink); font-weight: 600; font-size: 0.86rem; text-decoration: none; }
+.nb-link:hover { background: var(--accent-soft); }
+
+/* wide tables and svgs inside blocks never cause sideways page scroll */
+.worked, .selfcheck, .recap { overflow-x: auto; }
+
+/* phones: slimmer padding so figures inside blocks keep readable text */
+@media (max-width: 420px) {
+  .callout.recap, .worked, .selfcheck { padding-left: 10px; padding-right: 10px; }
+  .recap .figure, .worked .figure { margin-left: -4px; margin-right: -4px; }
+}
+
+
+/* dark mode: same treatment the kit gives .model-answer (accent-soft stays pastel) */
+[data-theme="dark"] .worked-answer,
+[data-theme="dark"] .nb-link:hover { background: color-mix(in srgb, var(--accent) 22%, var(--card)); }
